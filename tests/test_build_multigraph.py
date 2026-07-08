@@ -130,3 +130,55 @@ def test_diagnose_reports_no_collapse_under_multigraph():
     # and the multigraph build actually preserves them
     g = build_from_json(ex, multigraph=True)
     assert g.number_of_edges() == len(ex["edges"])
+
+
+# --------------------------------------------------------------------------
+# CLI end-to-end lock: `graphify extract ... --multigraph` must make the
+# exported graph.json self-describing (top-level `multigraph`) in BOTH the
+# clustered and --no-cluster write paths, and must NOT alter the default.
+# Regression guard for the two-path bug (#extract had a separate --no-cluster
+# raw-dump branch that bypassed build() and dropped the flag).
+# --------------------------------------------------------------------------
+import json as _json
+import subprocess as _sp
+import sys as _sys
+
+
+def _run_extract(tmp_path, *flags):
+    """Run the real CLI in a fresh dir and return the parsed graph.json."""
+    src = tmp_path / "s.py"
+    src.write_text("def helper():\n    return 1\ndef main():\n    return helper()\n",
+                   encoding="utf-8")
+    proc = _sp.run(
+        [_sys.executable, "-m", "graphify", "extract", str(tmp_path), "--no-llm", *flags],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"extract failed: {proc.stderr}\n{proc.stdout}"
+    gj = tmp_path / "graphify-out" / "graph.json"
+    assert gj.exists(), f"graph.json not written: {proc.stdout}"
+    return _json.loads(gj.read_text(encoding="utf-8"))
+
+
+def test_cli_multigraph_clustered_sets_true(tmp_path):
+    """Clustered path + --multigraph -> exported graph.json has multigraph == True."""
+    data = _run_extract(tmp_path, "--multigraph")
+    assert data.get("multigraph") is True
+
+
+def test_cli_multigraph_no_cluster_sets_true(tmp_path):
+    """Raw --no-cluster path + --multigraph is self-describing (multigraph == True).
+    Locks the two-path bug where the raw-dump branch bypassed build()."""
+    data = _run_extract(tmp_path, "--no-cluster", "--multigraph")
+    assert data.get("multigraph") is True
+
+
+def test_cli_default_clustered_not_multigraph(tmp_path):
+    """Default clustered export is a DiGraph (node_link_data emits multigraph == False)."""
+    data = _run_extract(tmp_path)
+    assert data.get("multigraph") is False
+
+
+def test_cli_default_no_cluster_omits_key(tmp_path):
+    """Default --no-cluster raw dump is byte-compatible: no multigraph key added."""
+    data = _run_extract(tmp_path, "--no-cluster")
+    assert "multigraph" not in data
