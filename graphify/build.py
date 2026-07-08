@@ -328,11 +328,19 @@ def graph_has_legacy_ids(nodes: list, root: str | Path | None = None, sample: in
     return False
 
 
-def build_from_json(extraction: dict, *, directed: bool = False, root: str | Path | None = None) -> nx.Graph:
+def build_from_json(extraction: dict, *, directed: bool = False, root: str | Path | None = None, multigraph: bool = False) -> nx.Graph:
     """Build a NetworkX graph from an extraction dict.
 
     directed=True produces a DiGraph that preserves edge direction (source→target).
     directed=False (default) produces an undirected Graph for backward compatibility.
+    multigraph=True produces a keyed MultiDiGraph so parallel edges between the
+        same (source, target) pair (e.g. a `calls` edge AND an `imports` edge, or
+        two calls on different lines) are preserved instead of collapsed. It is
+        opt-in and implies directed semantics. The runtime is first checked via
+        require_multigraph_capabilities(), which raises RuntimeError with an
+        actionable message if the installed NetworkX/Python cannot round-trip
+        keyed MultiDiGraph node-link data. Each parallel edge is keyed
+        `relation:source_file:source_location` (e.g. "calls:a.py:L1").
     root: if given, absolute source_file paths from semantic subagents are made
         relative to root so all nodes share a consistent path key (#932).
     """
@@ -408,7 +416,18 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             if isinstance(he, dict) and isinstance(he.get("nodes"), list):
                 he["nodes"] = [_rekey.get(n, n) for n in he["nodes"]]
 
-    G: nx.Graph = nx.DiGraph() if directed else nx.Graph()
+    if multigraph:
+        # Opt-in keyed MultiDiGraph: preserve parallel edges between the same
+        # (src, tgt) pair instead of silently collapsing them (the default
+        # nx.Graph/DiGraph behaviour that `graphify diagnose multigraph`
+        # reports as directed_same_endpoint_collapsed_edges). Gate on the
+        # runtime capability probe first so an incompatible NetworkX/Python
+        # fails loudly with remediation rather than corrupting the graph.
+        from graphify.multigraph_compat import require_multigraph_capabilities
+        require_multigraph_capabilities()
+        G: nx.Graph = nx.MultiDiGraph()
+    else:
+        G = nx.DiGraph() if directed else nx.Graph()
     for node in extraction.get("nodes", []):
         # Skip dict nodes with a missing or non-hashable id (e.g. a list emitted
         # by a buggy LLM extraction) so NetworkX add_node never raises
@@ -650,7 +669,20 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                 existing.get("_src") == tgt and existing.get("_tgt") == src
             ):
                 continue
-        G.add_edge(src, tgt, **attrs)
+        if G.is_multigraph():
+            # Deterministic per-edge key so parallel edges between the same
+            # (src, tgt) pair stay distinct. Reuse the upstream compat scheme
+            # relation:source_file:source_location (source_location is already
+            # "L{line}", giving e.g. "calls:a.py:L1"). Edges that truly share
+            # all three are the same edge and intentionally coalesce.
+            _mg_key = "{}:{}:{}".format(
+                attrs.get("relation", "edge"),
+                attrs.get("source_file", ""),
+                attrs.get("source_location", ""),
+            )
+            G.add_edge(src, tgt, key=_mg_key, **attrs)
+        else:
+            G.add_edge(src, tgt, **attrs)
     hyperedges = extraction.get("hyperedges", [])
     if hyperedges:
         # Relativize hyperedge source_file the same way nodes and edges are
@@ -670,11 +702,14 @@ def build(
     dedup: bool = True,
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
+    multigraph: bool = False,
 ) -> nx.Graph:
     """Merge multiple extraction results into one graph.
 
     directed=True produces a DiGraph that preserves edge direction (source→target).
     directed=False (default) produces an undirected Graph for backward compatibility.
+    multigraph=True produces a keyed MultiDiGraph (implies directed) so parallel
+        edges between the same node pair are preserved; see build_from_json.
     dedup=True (default) runs entity deduplication before building the graph.
     dedup_llm_backend: if set (e.g. "gemini", "claude", or "kimi"), uses LLM to resolve
         ambiguous pairs in the 75–92 Jaro-Winkler score zone.
@@ -698,7 +733,7 @@ def build(
             combined["nodes"], combined["edges"], communities={},
             dedup_llm_backend=dedup_llm_backend,
         )
-    return build_from_json(combined, directed=directed, root=root)
+    return build_from_json(combined, directed=directed, root=root, multigraph=multigraph)
 
 
 def _norm_label(label: str | None) -> str:
