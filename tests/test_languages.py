@@ -553,6 +553,80 @@ def test_java_enum_and_annotation_declarations_are_type_nodes(tmp_path):
     assert definitions["Audited"].get("source_file") == str(source)
 
 
+def _annotation_edge_meta(result: dict, src_label: str, tgt_label: str) -> dict:
+    """Return the metadata dict of the references/attribute edge src->tgt (by label)."""
+    labels = {node["id"]: _normalize_symbol_label(node["label"]) for node in result["nodes"]}
+    for edge in result["edges"]:
+        if edge.get("relation") != "references" or edge.get("context") != "attribute":
+            continue
+        if labels.get(edge["source"]) == src_label and labels.get(edge["target"]) == tgt_label:
+            return edge.get("metadata") or {}
+    raise AssertionError(f"missing annotation edge {src_label!r}->{tgt_label!r}")
+
+
+def test_java_service_class_carries_bean_stereotype_fact(tmp_path):
+    """@Service class -> class node metadata bean_stereotype (additive; §1A-core)."""
+    source = tmp_path / "Svc.java"
+    source.write_text("@Service\nclass PaymentSvc {}\n")
+
+    result = extract_java(source)
+
+    node = _node_by_label(result, "PaymentSvc")
+    assert (node.get("metadata") or {}).get("bean_stereotype") == "Service"
+    # the annotation edge is enriched but topology (relation/context) is unchanged
+    assert ("PaymentSvc", "Service") in _edge_labels(result, "references", "attribute")
+    meta = _annotation_edge_meta(result, "PaymentSvc", "Service")
+    assert meta.get("annotation") == "Service"
+    assert meta.get("annotation_role") == "bean_stereotype"
+
+
+def test_java_restcontroller_class_marks_http_endpoint(tmp_path):
+    """@RestController -> http_endpoint + bean_stereotype node facts; edge role=exposure."""
+    source = tmp_path / "Api.java"
+    source.write_text('@RestController\nclass OrderApi {}\n')
+
+    result = extract_java(source)
+
+    md = _node_by_label(result, "OrderApi").get("metadata") or {}
+    assert md.get("http_endpoint") is True
+    assert md.get("bean_stereotype") == "RestController"
+    # exposure wins over stereotype on the edge role (priority order)
+    assert _annotation_edge_meta(result, "OrderApi", "RestController").get(
+        "annotation_role"
+    ) == "exposure"
+
+
+def test_java_preauthorize_class_is_authz_guarded(tmp_path):
+    """@PreAuthorize(...) -> authz_guarded node fact; edge role=authz_guard."""
+    source = tmp_path / "Guard.java"
+    source.write_text('@PreAuthorize("hasRole(\'ADMIN\')")\nclass AdminOps {}\n')
+
+    result = extract_java(source)
+
+    assert (_node_by_label(result, "AdminOps").get("metadata") or {}).get(
+        "authz_guarded"
+    ) is True
+    assert _annotation_edge_meta(result, "AdminOps", "PreAuthorize").get(
+        "annotation_role"
+    ) == "authz_guard"
+
+
+def test_java_unclassified_annotation_has_no_role_or_facts(tmp_path):
+    """@Entity (unclassified) -> edge carries annotation name but NO role; no node facts."""
+    source = tmp_path / "Ent.java"
+    source.write_text('@Entity(name = "orders")\nclass OrderRow {}\n')
+
+    result = extract_java(source)
+
+    node_md = _node_by_label(result, "OrderRow").get("metadata") or {}
+    assert "bean_stereotype" not in node_md
+    assert "http_endpoint" not in node_md
+    assert "authz_guarded" not in node_md
+    meta = _annotation_edge_meta(result, "OrderRow", "Entity")
+    assert meta.get("annotation") == "Entity"
+    assert "annotation_role" not in meta
+
+
 def test_csharp_field_type_references_have_field_context():
     r = extract_csharp(FIXTURES / "sample.cs")
     refs = _references(r)

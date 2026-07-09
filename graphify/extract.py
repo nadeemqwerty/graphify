@@ -1010,6 +1010,65 @@ def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
     return names
 
 
+# --- Java/Groovy annotation classification (LLM-comprehension facts) -----------
+# Bare annotation short-names (already `.rsplit(".",1)[-1]`-normalized by
+# `_java_annotation_names`) grouped by the semantic role they signal to a
+# downstream reader. These drive additive `metadata` on the class node and on the
+# existing `references`/`attribute` annotation edge — they never change graph
+# topology (no new nodes/edges), so cached/uncached extraction stays byte-stable.
+_JAVA_ANNO_EXPOSURE = frozenset({
+    "RestController", "Controller", "RequestMapping", "GetMapping", "PostMapping",
+    "PutMapping", "DeleteMapping", "PatchMapping", "FeignClient",
+})
+_JAVA_ANNO_AUTHZ = frozenset({
+    "PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed",
+    "PermitAll", "DenyAll", "PreFilter", "PostFilter",
+})
+_JAVA_ANNO_STEREOTYPE = frozenset({
+    "Service", "Component", "Repository", "Configuration",
+    "RestController", "Controller",
+})
+_JAVA_ANNO_INJECTION = frozenset({"Autowired", "Inject", "Resource"})
+
+
+def _classify_java_annotation(name: str) -> str | None:
+    """Map a bare Java annotation short-name to one LLM-comprehension role bucket.
+
+    Priority resolves overlaps (e.g. `@RestController` is both an exposure marker
+    and a bean stereotype): authz_guard > exposure > bean_stereotype > injection.
+    Returns ``None`` for annotations we don't classify — those keep only the
+    generic ``references``/``attribute`` edge with no ``annotation_role``.
+    """
+    if name in _JAVA_ANNO_AUTHZ:
+        return "authz_guard"
+    if name in _JAVA_ANNO_EXPOSURE:
+        return "exposure"
+    if name in _JAVA_ANNO_STEREOTYPE:
+        return "bean_stereotype"
+    if name in _JAVA_ANNO_INJECTION:
+        return "injection"
+    return None
+
+
+def _java_class_annotation_facts(anno_names: list[str]) -> dict:
+    """Derive class-level annotation facts from its class-level annotation names.
+
+    Returns a (possibly empty) dict folded into the class node ``metadata``:
+      * ``bean_stereotype`` — first Spring stereotype found (Service/Component/…)
+      * ``http_endpoint``   — True if any exposure annotation is present
+      * ``authz_guarded``   — True if any method-security annotation is present
+    """
+    facts: dict = {}
+    stereotype = next((n for n in anno_names if n in _JAVA_ANNO_STEREOTYPE), None)
+    if stereotype:
+        facts["bean_stereotype"] = stereotype
+    if any(n in _JAVA_ANNO_EXPOSURE for n in anno_names):
+        facts["http_endpoint"] = True
+    if any(n in _JAVA_ANNO_AUTHZ for n in anno_names):
+        facts["authz_guarded"] = True
+    return facts
+
+
 _GO_PREDECLARED_TYPES = frozenset({
     "bool", "byte", "complex64", "complex128", "error", "float32", "float64",
     "int", "int8", "int16", "int32", "int64", "rune", "string",
@@ -3691,6 +3750,15 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
+            # Java/Groovy: classify class-level annotations once here and reuse the
+            # collected names for the annotation-edge loop below (avoids a second
+            # tree walk). Facts are additive metadata — topology is unchanged.
+            java_anno_names: list[str] = []
+            if config.ts_module in ("tree_sitter_java", "tree_sitter_groovy"):
+                java_anno_names = _java_annotation_names(node, source)
+                anno_facts = _java_class_annotation_facts(java_anno_names)
+                if anno_facts:
+                    metadata = {**(metadata or {}), **anno_facts}
             add_node(class_nid, class_name, line, metadata=metadata)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             add_edge(file_nid, class_nid, "contains", line)
@@ -4031,11 +4099,15 @@ def _extract_generic(
                                         if tid.is_named:
                                             _emit_java_parent_type(tid, "inherits", line)
 
-                for anno_name in _java_annotation_names(node, source):
+                for anno_name in java_anno_names:
                     target_nid = ensure_named_node(anno_name, line)
                     if target_nid != class_nid:
+                        anno_meta: dict[str, str] = {"annotation": anno_name}
+                        anno_role = _classify_java_annotation(anno_name)
+                        if anno_role:
+                            anno_meta["annotation_role"] = anno_role
                         add_edge(class_nid, target_nid, "references", line,
-                                 context="attribute")
+                                 context="attribute", metadata=anno_meta)
 
                 if t == "record_declaration":
                     components = node.child_by_field_name("parameters")
