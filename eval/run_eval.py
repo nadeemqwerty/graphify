@@ -25,10 +25,28 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+# graphify flushes its stat-index cache via its OWN atexit hook (registered at
+# import time), which re-creates the per-run cache dir AFTER an ordinary cleanup
+# has already removed it. atexit callbacks fire LIFO, so registering our cleanup
+# *before* importing graphify guarantees ours runs LAST -- after graphify's
+# flush -- so the temp cache is always fully removed (no leftover graphify-eval-*
+# dirs). This is cleanup-only and runs post-computation: it cannot affect answers.
+_EVAL_TMP_DIRS: list[Path] = []
+
+
+def _cleanup_eval_tmp_dirs() -> None:
+    for d in _EVAL_TMP_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+atexit.register(_cleanup_eval_tmp_dirs)
 
 from graphify.extract import extract
 from graphify.build import build_from_json
@@ -50,7 +68,11 @@ def load_extraction(fixtures: Path) -> dict:
     files = sorted(fixtures.glob("*.java"))
     if not files:
         raise SystemExit(f"no .java fixtures found under {fixtures}")
+    # Fresh temp cache each run; tracked in _EVAL_TMP_DIRS and removed by the
+    # atexit hook above (ordered to run AFTER graphify's own cache flush), so no
+    # graphify-eval-* dir survives the process.
     cache_root = Path(tempfile.mkdtemp(prefix="graphify-eval-"))
+    _EVAL_TMP_DIRS.append(cache_root)
     return extract(files, cache_root=cache_root)
 
 
