@@ -1,0 +1,19 @@
+{
+  "_doc": "Machine-checkable ground truth for the method-level-authz-coverage question. Hand-verified from the Java source, INDEPENDENT of graphify output (never generated from the extractor). Question: does the controller enforce authorization on EVERY one of its HTTP endpoints?",
+  "ClassGuardedController": {
+    "fully_guarded": true,
+    "reason": "class-level @PreAuthorize covers a() and b()"
+  },
+  "MethodGuardedController": {
+    "fully_guarded": false,
+    "reason": "open() endpoint has no @PreAuthorize; only secure() is guarded"
+  },
+  "OpenController": {
+    "fully_guarded": false,
+    "reason": "no authorization anywhere"
+  },
+  "MixedController": {
+    "fully_guarded": true,
+    "reason": "every endpoint (one(), two()) carries method-level @PreAuthorize"
+  }
+}
