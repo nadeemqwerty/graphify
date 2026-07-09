@@ -627,6 +627,44 @@ def test_java_unclassified_annotation_has_no_role_or_facts(tmp_path):
     assert "annotation_role" not in meta
 
 
+def test_java_method_reference_emits_call_signals(tmp_path):
+    """Java `::` method references feed the same call-extraction path as `.`/`new` calls.
+
+    - `Widget::new` (constructor ref) resolves in-file -> a `calls` edge run->Widget.
+    - `Helper::format` (static member ref) captures a raw_call (callee/receiver) for
+      the cross-file resolver, mirroring a plain `Helper.format()` static call.
+    - `System.out::println` (qualified receiver) bails the receiver but still captures
+      the callee name, so a qualified ref is never silently dropped.
+    """
+    source = tmp_path / "Refs.java"
+    source.write_text(
+        "class Helper { static String format(Object o) { return \"\"; } }\n"
+        "class Widget { Widget() {} }\n"
+        "class Main {\n"
+        "  void run() {\n"
+        "    java.util.function.Function<Object,String> f = Helper::format;\n"
+        "    java.util.function.Supplier<Widget> s = Widget::new;\n"
+        "    Runnable r = System.out::println;\n"
+        "  }\n"
+        "}\n"
+    )
+
+    result = extract_java(source)
+
+    # constructor ref -> in-file calls edge
+    assert (".run()", ".Widget()") in _calls(result)
+
+    raw = result.get("raw_calls") or []
+    by_callee = {rc.get("callee"): rc for rc in raw}
+    # static member ref -> raw_call carries callee + capitalized receiver for cross-file resolution
+    assert "format" in by_callee
+    assert by_callee["format"].get("is_member_call") is True
+    assert by_callee["format"].get("receiver") == "Helper"
+    # qualified-receiver ref -> receiver bailed, but callee still captured (not dropped)
+    assert "println" in by_callee
+    assert by_callee["println"].get("receiver") is None
+
+
 def test_csharp_field_type_references_have_field_context():
     r = extract_csharp(FIXTURES / "sample.cs")
     refs = _references(r)

@@ -3099,9 +3099,12 @@ _JAVA_CONFIG = LanguageConfig(
     }),
     function_types=frozenset({"method_declaration", "constructor_declaration"}),
     import_types=frozenset({"import_declaration"}),
-    # object_creation_expression (`new Foo(...)`) is handled by a dedicated Java
-    # branch in walk_calls below — its callee is in the `type` field, not `name`.
-    call_types=frozenset({"method_invocation", "object_creation_expression"}),
+    # object_creation_expression (`new Foo(...)`) and method_reference
+    # (`Type::method`, `Type::new`) are handled by dedicated Java branches in
+    # walk_calls below — their callee is not in the generic `name` field.
+    call_types=frozenset({
+        "method_invocation", "object_creation_expression", "method_reference",
+    }),
     call_function_field="name",
     call_accessor_node_types=frozenset(),
     function_boundary_types=frozenset({"method_declaration", "constructor_declaration"}),
@@ -5298,6 +5301,41 @@ def _extract_generic(
                     raw = _read_text(type_node, source).split("<", 1)[0].strip()
                     if raw:
                         callee_name = raw.rsplit(".", 1)[-1]
+            elif config.ts_module == "tree_sitter_java" and node.type == "method_reference":
+                # Java 8 method reference `Receiver::method` / `Type::new`.
+                # method_reference has NO named fields (verified against the
+                # tree-sitter-java grammar), so the generic `name`-field path
+                # silently drops it. Structure (ignoring the `::` token and any
+                # `type_arguments`): child[0] = receiver/type, last child = the
+                # callee token — an `identifier` for a normal ref, or the `new`
+                # keyword for a constructor reference.
+                #   `Helper::format`      -> member call, receiver "Helper"
+                #   `System.out::println` -> callee "println", receiver bailed
+                #                            (field_access, not a simple name)
+                #   `A::new`              -> constructor ref, callee = type "A"
+                #                            (parallels object_creation above)
+                kids = [c for c in node.children if c.type != "::"]
+                if kids:
+                    last = kids[-1]
+                    recv_node = kids[0] if len(kids) >= 2 else None
+                    if last.type == "new":
+                        # constructor reference: callee is the constructed type's
+                        # simple name (com.a.Foo<Bar> -> Foo), like `new Foo()`.
+                        if recv_node is not None:
+                            raw = _read_text(recv_node, source).split("<", 1)[0].strip()
+                            if raw:
+                                callee_name = raw.rsplit(".", 1)[-1]
+                    else:
+                        callee_name = _read_text(last, source)
+                        # A simple-identifier receiver (a type/var name) binds
+                        # like a static member call `Type.method()`; capture it
+                        # so cross-file resolution can match by the receiver's
+                        # declared type. A qualified receiver (field_access such
+                        # as `System.out`) is bailed, mirroring the chained-call
+                        # rule for method_invocation.
+                        if recv_node is not None and recv_node.type == "identifier":
+                            is_member_call = True
+                            member_receiver = _read_text(recv_node, source)
             elif config.ts_module == "tree_sitter_ruby":
                 # Ruby's `call` node carries `receiver` and `method` as direct
                 # fields (no intermediate accessor node), so the generic accessor
