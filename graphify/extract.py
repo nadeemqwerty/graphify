@@ -1010,6 +1010,87 @@ def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
     return names
 
 
+# --- Java/Groovy annotation classification (LLM-comprehension facts) -----------
+# Bare annotation short-names (already `.rsplit(".",1)[-1]`-normalized by
+# `_java_annotation_names`) grouped by the semantic role they signal to a
+# downstream reader. These drive additive `metadata` on the class node and on the
+# existing `references`/`attribute` annotation edge — they never change graph
+# topology (no new nodes/edges), so cached/uncached extraction stays
+# topology-stable (node/edge SET is unchanged; only additive metadata differs).
+_JAVA_ANNO_EXPOSURE = frozenset({
+    "RestController", "Controller", "RequestMapping", "GetMapping", "PostMapping",
+    "PutMapping", "DeleteMapping", "PatchMapping",
+})
+# Outbound HTTP clients (Spring Cloud OpenFeign) — an inbound endpoint marker would
+# be misleading here: `@FeignClient` declares a caller, not a server route.
+_JAVA_ANNO_HTTP_CLIENT = frozenset({"FeignClient"})
+_JAVA_ANNO_AUTHZ = frozenset({
+    "PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed",
+    "DenyAll", "PreFilter", "PostFilter",
+})
+# `@PermitAll` is the inverse of a guard — it explicitly marks the target *public*.
+# Bucketing it with the guards above would let a reader mistake an intentionally
+# open endpoint for a secured one, so it gets its own non-guard role.
+_JAVA_ANNO_AUTHZ_PUBLIC = frozenset({"PermitAll"})
+_JAVA_ANNO_STEREOTYPE = frozenset({
+    "Service", "Component", "Repository", "Configuration",
+    "RestController", "Controller",
+})
+_JAVA_ANNO_INJECTION = frozenset({"Autowired", "Inject", "Resource"})
+
+
+def _classify_java_annotation(name: str) -> str | None:
+    """Map a bare Java annotation short-name to one LLM-comprehension role bucket.
+
+    Priority resolves overlaps (e.g. `@RestController` is both an exposure marker
+    and a bean stereotype): authz_guard > authz_public > exposure > http_client >
+    bean_stereotype > injection.
+    Returns ``None`` for annotations we don't classify — those keep only the
+    generic ``references``/``attribute`` edge with no ``annotation_role``.
+    """
+    if name in _JAVA_ANNO_AUTHZ:
+        return "authz_guard"
+    if name in _JAVA_ANNO_AUTHZ_PUBLIC:
+        return "authz_public"
+    if name in _JAVA_ANNO_EXPOSURE:
+        return "exposure"
+    if name in _JAVA_ANNO_HTTP_CLIENT:
+        return "http_client"
+    if name in _JAVA_ANNO_STEREOTYPE:
+        return "bean_stereotype"
+    if name in _JAVA_ANNO_INJECTION:
+        return "injection"
+    return None
+
+
+def _java_class_annotation_facts(anno_names: list[str]) -> dict:
+    """Derive class-level annotation facts from its class-level annotation names.
+
+    Returns a (possibly empty) dict folded into the class node ``metadata``:
+      * ``bean_stereotype``      — first Spring stereotype found (Service/Component/…)
+      * ``http_endpoint``        — True if any inbound exposure annotation is present
+      * ``http_client``          — True if an outbound client annotation (@FeignClient)
+      * ``class_authz_guarded``  — True if a *class-level* method-security annotation is
+        present. NOTE: this is class-scoped only. A class secured solely via
+        method-level `@PreAuthorize` will NOT set this — absence here is not proof the
+        class is unguarded; consult the method-level annotation-edge ``annotation_role``.
+      * ``class_authz_public``   — True if a class-level `@PermitAll` marks it public
+    """
+    facts: dict = {}
+    stereotype = next((n for n in anno_names if n in _JAVA_ANNO_STEREOTYPE), None)
+    if stereotype:
+        facts["bean_stereotype"] = stereotype
+    if any(n in _JAVA_ANNO_EXPOSURE for n in anno_names):
+        facts["http_endpoint"] = True
+    if any(n in _JAVA_ANNO_HTTP_CLIENT for n in anno_names):
+        facts["http_client"] = True
+    if any(n in _JAVA_ANNO_AUTHZ for n in anno_names):
+        facts["class_authz_guarded"] = True
+    if any(n in _JAVA_ANNO_AUTHZ_PUBLIC for n in anno_names):
+        facts["class_authz_public"] = True
+    return facts
+
+
 _GO_PREDECLARED_TYPES = frozenset({
     "bool", "byte", "complex64", "complex128", "error", "float32", "float64",
     "int", "int8", "int16", "int32", "int64", "rune", "string",
@@ -2422,6 +2503,59 @@ def _csharp_member_type_table(root, source: bytes) -> dict[str, str]:
     return table
 
 
+def _java_member_type_table(root, source: bytes) -> dict[str, str]:
+    """Collect ``name -> TypeName`` for Java receiver typing (Gate-A): class fields,
+    method/constructor parameters, and local variable declarations.
+
+    File-scoped, first-binding-wins (mirrors the C# table, #1609): a field declared
+    once at class scope is visible to every method's ``field.method()``. Only a
+    resolvable, Pascal-cased reference type is recorded; primitives, type parameters,
+    and lower-cased names are skipped (precision over recall — an untypable receiver
+    is left for the resolver to drop rather than guess).
+    """
+    table: dict[str, str] = {}
+
+    def _typed(type_node) -> str | None:
+        if type_node is None:
+            return None
+        refs: list[tuple[str, str]] = []
+        _java_collect_type_refs(type_node, source, False, refs)
+        for name, role in refs:
+            if role == "type":
+                # A resolvable Java reference type is Pascal-cased; skip primitives
+                # and lower-cased names that never own a resolvable method here.
+                return name if name and name[:1].isupper() else None
+        return None
+
+    def _declarator_names(decl_parent):
+        for c in decl_parent.children:
+            if c.type == "variable_declarator":
+                nm = c.child_by_field_name("name")
+                if nm is not None:
+                    yield _read_text(nm, source)
+
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        t = n.type
+        if t in ("field_declaration", "local_variable_declaration"):
+            resolved = _typed(n.child_by_field_name("type"))
+            if resolved:
+                for name in _declarator_names(n):
+                    if name and name not in table:
+                        table[name] = resolved
+        elif t == "formal_parameter":
+            nm = n.child_by_field_name("name")
+            resolved = _typed(n.child_by_field_name("type"))
+            if nm is not None and resolved:
+                pname = _read_text(nm, source)
+                if pname not in table:
+                    table[pname] = resolved
+        for c in n.children:
+            stack.append(c)
+    return table
+
+
 def _ts_receiver_type_table(root, source: bytes, table: dict[str, str]) -> None:
     """Add TS/JS receiver bindings to ``table`` (name -> TypeName), for member-call
     resolution beyond the constructor-injected `this.field` case (#1630):
@@ -3040,9 +3174,12 @@ _JAVA_CONFIG = LanguageConfig(
     }),
     function_types=frozenset({"method_declaration", "constructor_declaration"}),
     import_types=frozenset({"import_declaration"}),
-    # object_creation_expression (`new Foo(...)`) is handled by a dedicated Java
-    # branch in walk_calls below — its callee is in the `type` field, not `name`.
-    call_types=frozenset({"method_invocation", "object_creation_expression"}),
+    # object_creation_expression (`new Foo(...)`) and method_reference
+    # (`Type::method`, `Type::new`) are handled by dedicated Java branches in
+    # walk_calls below — their callee is not in the generic `name` field.
+    call_types=frozenset({
+        "method_invocation", "object_creation_expression", "method_reference",
+    }),
     call_function_field="name",
     call_accessor_node_types=frozenset(),
     function_boundary_types=frozenset({"method_declaration", "constructor_declaration"}),
@@ -3691,6 +3828,15 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
+            # Java/Groovy: classify class-level annotations once here and reuse the
+            # collected names for the annotation-edge loop below (avoids a second
+            # tree walk). Facts are additive metadata — topology is unchanged.
+            java_anno_names: list[str] = []
+            if config.ts_module in ("tree_sitter_java", "tree_sitter_groovy"):
+                java_anno_names = _java_annotation_names(node, source)
+                anno_facts = _java_class_annotation_facts(java_anno_names)
+                if anno_facts:
+                    metadata = {**(metadata or {}), **anno_facts}
             add_node(class_nid, class_name, line, metadata=metadata)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             add_edge(file_nid, class_nid, "contains", line)
@@ -4031,11 +4177,15 @@ def _extract_generic(
                                         if tid.is_named:
                                             _emit_java_parent_type(tid, "inherits", line)
 
-                for anno_name in _java_annotation_names(node, source):
+                for anno_name in java_anno_names:
                     target_nid = ensure_named_node(anno_name, line)
                     if target_nid != class_nid:
+                        anno_meta: dict[str, str] = {"ref_token": anno_name, "annotation": anno_name}
+                        anno_role = _classify_java_annotation(anno_name)
+                        if anno_role:
+                            anno_meta["annotation_role"] = anno_role
                         add_edge(class_nid, target_nid, "references", line,
-                                 context="attribute")
+                                 context="attribute", metadata=anno_meta)
 
                 if t == "record_declaration":
                     components = node.child_by_field_name("parameters")
@@ -4571,7 +4721,14 @@ def _extract_generic(
                 for anno_name in _java_annotation_names(node, source):
                     target_nid = ensure_named_node(anno_name, line)
                     if target_nid != func_nid:
-                        add_edge(func_nid, target_nid, "references", line, context="attribute")
+                        m_anno_meta: dict[str, str] = {
+                            "ref_token": anno_name, "annotation": anno_name,
+                        }
+                        m_anno_role = _classify_java_annotation(anno_name)
+                        if m_anno_role:
+                            m_anno_meta["annotation_role"] = m_anno_role
+                        add_edge(func_nid, target_nid, "references", line,
+                                 context="attribute", metadata=m_anno_meta)
 
             if config.ts_module == "tree_sitter_php":
                 params_container = None
@@ -5220,12 +5377,91 @@ def _extract_generic(
                 # `new Foo(...)` — the constructed type is in the `type` field, not
                 # `name`, so the generic path misses it (#1373). Reduce a qualified
                 # / generic type to its simple name (com.a.Foo<Bar> -> Foo). Java
-                # method_invocation still flows through the generic branch below.
+                # method_invocation is handled by its own dedicated branch below.
                 type_node = node.child_by_field_name("type")
                 if type_node is not None:
                     raw = _read_text(type_node, source).split("<", 1)[0].strip()
                     if raw:
                         callee_name = raw.rsplit(".", 1)[-1]
+            elif config.ts_module == "tree_sitter_java" and node.type == "method_reference":
+                # Java 8 method reference `Receiver::method` / `Type::new`.
+                # method_reference has NO named fields (verified against the
+                # tree-sitter-java grammar), so the generic `name`-field path
+                # silently drops it. Structure (ignoring the `::` token and any
+                # `type_arguments`): child[0] = receiver/type, last child = the
+                # callee token — an `identifier` for a normal ref, or the `new`
+                # keyword for a constructor reference.
+                #   `Helper::format`      -> callee "format", no member flag
+                #                            (mirrors `Helper.format(o)` exactly)
+                #   `System.out::println` -> callee "println" (bare, like the dot form)
+                #   `A::new`              -> constructor ref, callee = type "A"
+                #                            (parallels object_creation above)
+                kids = [c for c in node.children if c.type != "::"]
+                if kids:
+                    last = kids[-1]
+                    recv_node = kids[0] if len(kids) >= 2 else None
+                    if last.type == "new":
+                        # constructor reference: callee is the constructed type's
+                        # simple name (com.a.Foo<Bar> -> Foo), like `new Foo()`.
+                        if recv_node is not None:
+                            raw = _read_text(recv_node, source).split("<", 1)[0].strip()
+                            if raw:
+                                callee_name = raw.rsplit(".", 1)[-1]
+                    else:
+                        # Emit the bare callee with NO member flag. A method
+                        # reference is left bare-name on purpose: unlike a
+                        # `recv.method(...)` invocation (which now captures its
+                        # receiver in the method_invocation branch below and binds
+                        # by the receiver's type), a `Type::method` / `recv::method`
+                        # reference is comparatively rare and receiver-typing it is
+                        # a separate feature — so `Helper::format` resolves by the
+                        # bare callee "format", as it always has.
+                        callee_name = _read_text(last, source)
+            elif config.ts_module == "tree_sitter_java" and node.type == "method_invocation":
+                # Java member call `recv.method(...)`. The `name` field is the
+                # callee; the `object` field is the receiver. Java historically
+                # fell through the generic branch below, which reads ONLY `name`
+                # (is_member_call stayed False) and resolved the bare method name
+                # cross-file — so it DROPPED the edge when the name collided across
+                # classes and MIS-BOUND when exactly one global candidate existed,
+                # ignoring the receiver's declared type (the Gate-A bug). Capture
+                # the receiver and set is_member_call so _resolve_java_member_calls
+                # binds by the receiver's type instead of the bare name.
+                mname = node.child_by_field_name("name")
+                if mname is not None:
+                    callee_name = _read_text(mname, source)
+                obj = node.child_by_field_name("object")
+                if obj is not None:
+                    # Syntactically a member call. BLOCKER #1 (precision over
+                    # recall): once it has a receiver it must NEVER fall back to a
+                    # bare-name in-file/cross-file match, even when the receiver
+                    # can't be typed — so set is_member_call unconditionally. The
+                    # defer gate below then routes ALL Java member calls to the
+                    # receiver-typed cross-file resolver, which binds by type or
+                    # SKIPS (no silent bare-name mis-bind).
+                    is_member_call = True
+                    if obj.type == "identifier":
+                        # `repo.save()` (field/local var) or `Helper.format()`
+                        # (a type name — a capitalized receiver is resolved as the
+                        # type itself in A2, not looked up in the var type table).
+                        member_receiver = _read_text(obj, source)
+                    elif obj.type == "this":
+                        # `this.save()` — receiver is the enclosing type.
+                        member_receiver = "this"
+                    elif obj.type == "field_access":
+                        # `this.repo.save()` — bind the field token `repo` through
+                        # the type table (#1316 this.field shape). Only the direct
+                        # `this.<field>` form is captured; deeper access chains are
+                        # left untyped (member_receiver=None -> SKIP).
+                        inner = obj.child_by_field_name("object")
+                        fld = obj.child_by_field_name("field")
+                        if (inner is not None and inner.type == "this"
+                                and fld is not None):
+                            member_receiver = _read_text(fld, source)
+                            is_this_field_call = True
+                    # Any other receiver (chained a().b().m(), qualified a.b.C.m(),
+                    # array access, ...) leaves member_receiver=None: is_member_call
+                    # stays True so it defers and, being untypeable, SKIPS.
             elif config.ts_module == "tree_sitter_ruby":
                 # Ruby's `call` node carries `receiver` and `method` as direct
                 # fields (no intermediate accessor node), so the generic accessor
@@ -5295,9 +5531,20 @@ def _extract_generic(
                     config.ts_module == "tree_sitter_c_sharp"
                     and is_member_call and member_receiver
                 )
-                if is_member_call and member_receiver and (
+                # Java: ANY member call (a call with an `object` field) defers to
+                # the receiver-typed cross-file resolver — even one whose receiver
+                # could not be captured (member_receiver=None for a chained/complex
+                # receiver). BLOCKER #1: an object-bearing call must never resolve
+                # to a bare method-name in-file match, or it silently mis-binds to
+                # an unrelated same-named method. member_receiver=None then SKIPS
+                # in the resolver (precision over recall).
+                _java_defer = (
+                    config.ts_module == "tree_sitter_java"
+                    and is_member_call
+                )
+                if _java_defer or (is_member_call and member_receiver and (
                     member_receiver[:1].isupper() or is_this_field_call or _csharp_defer
-                ):
+                )):
                     tgt_nid = None
                 else:
                     tgt_nid = label_to_nid.get(callee_name)
@@ -5343,6 +5590,12 @@ def _extract_generic(
                     # type table (#1609).
                     if config.ts_module == "tree_sitter_c_sharp":
                         rc_entry["lang"] = "csharp"
+                    # Java: tag the raw_call so _resolve_java_member_calls claims it
+                    # and types the receiver against the file's field/param/local
+                    # type table (Gate-A). member_receiver=None (untypeable
+                    # receiver) is preserved so the resolver can SKIP it.
+                    if config.ts_module == "tree_sitter_java":
+                        rc_entry["lang"] = "java"
                     raw_calls.append(rc_entry)
 
             # Indirect dispatch: a function passed BY NAME as a call argument
@@ -5709,6 +5962,13 @@ def _extract_generic(
         cs_table = _csharp_member_type_table(root, source)
         if cs_table:
             result["csharp_type_table"] = {"path": str_path, "table": cs_table}
+    # Java: a file-wide receiver type table (field/param/local -> Type) for
+    # _resolve_java_member_calls (Gate-A). Built from the whole tree so class-level
+    # fields are in scope for every method, mirroring the C# block above.
+    if config.ts_module == "tree_sitter_java":
+        jt_table = _java_member_type_table(root, source)
+        if jt_table:
+            result["java_type_table"] = {"path": str_path, "table": jt_table}
     return result
 
 
@@ -12291,6 +12551,149 @@ def _resolve_csharp_member_calls(
         })
 
 
+def _resolve_java_member_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Java member calls (``recv.method()``) to the receiver's declared type
+    (Gate-A).
+
+    Ported from :func:`_resolve_csharp_member_calls` (#1609). The shared cross-file
+    pass drops every ``is_member_call`` (a bare method name collides across the
+    corpus) or, worse, mis-binds a name-unique method ignoring the receiver type. The
+    Java extractor now records each member call's receiver plus a per-file
+    ``name -> Type`` table (``java_type_table``) of fields/params/locals. This pass
+    types the receiver, then emits an edge ONLY when that type resolves to exactly ONE
+    definition (the god-node guard); an untypable receiver is skipped (no guess).
+
+    Java delta vs the C# port — **virtual dispatch / interface expansion**: when the
+    receiver's static type is an interface, the call dispatches to the concrete
+    implementor's override, not the abstract declaration. ``implements`` edges point
+    implementor -> interface, so an interface's implementors are the edge SOURCES. If
+    exactly one implementor declares the method, bind to it; if none do and the type
+    itself declares it (concrete class, or an interface with only an abstract/default
+    method), bind to the type; otherwise (>=2 competing implementors, or unresolved)
+    skip — precision over recall.
+
+    Receiver typing, by precision tier:
+      * ``this.m()`` — receiver is the caller's own enclosing class -> EXTRACTED.
+      * ``Type.m()`` (capitalized) — the type is named explicitly in source -> EXTRACTED.
+      * ``recv.m()`` — ``recv`` typed via the file's field/param/local table -> INFERRED.
+
+    Must run after id-disambiguation so node ids and caller_nids are final.
+    """
+    type_table_by_file: dict[str, dict[str, str]] = {}
+    for result in per_file:
+        tt = result.get("java_type_table")
+        if tt and tt.get("path"):
+            type_table_by_file[tt["path"]] = tt.get("table", {})
+
+    def _key(label: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
+
+    contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
+
+    type_def_nids: dict[str, list[str]] = {}
+    node_by_id: dict[str, dict] = {}
+    for n in all_nodes:
+        node_by_id[n.get("id")] = n
+        if n.get("source_file") and n.get("id") in contained and _is_type_like_definition(n):
+            type_def_nids.setdefault(_key(n.get("label", "")), []).append(n["id"])
+
+    # (type_node_id, method_key) -> method_node_id, and caller -> enclosing type.
+    # Java owns its methods via `method` edges (same model as C#).
+    method_index: dict[tuple[str, str], str] = {}
+    enclosing_type: dict[str, str] = {}
+    for e in all_edges:
+        if e.get("relation") != "method":
+            continue
+        src, tgt = e.get("source"), e.get("target")
+        tnode = node_by_id.get(tgt)
+        if tnode is None:
+            continue
+        enclosing_type.setdefault(tgt, src)
+        method_index[(src, _key(tnode.get("label", "")))] = tgt
+
+    # interface_type_nid -> [implementor_type_nid, ...] (implements: impl -> iface).
+    implementors: dict[str, list[str]] = {}
+    for e in all_edges:
+        if e.get("relation") == "implements":
+            implementors.setdefault(e.get("target"), []).append(e.get("source"))
+
+    all_raw_calls: list[dict] = []
+    for result in per_file:
+        all_raw_calls.extend(result.get("raw_calls", []))
+
+    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+    for rc in all_raw_calls:
+        if rc.get("lang") != "java" or not rc.get("is_member_call"):
+            continue
+        receiver = rc.get("receiver")
+        callee = rc.get("callee")
+        caller = rc.get("caller_nid")
+        if not receiver or not callee or not caller:
+            continue
+        src_file = rc.get("source_file", "")
+        if receiver == "this":
+            type_nid = enclosing_type.get(caller)
+            if not type_nid:
+                continue
+            type_qualified = True
+        elif receiver[:1].isupper():
+            # Type.m() — the type is named explicitly (also covers a Pascal-cased
+            # local whose name equals its type, resolved via the table below if the
+            # explicit-type lookup misses).
+            type_defs = type_def_nids.get(_key(receiver), [])
+            if len(type_defs) != 1:
+                type_name = type_table_by_file.get(src_file, {}).get(receiver)
+                type_defs = type_def_nids.get(_key(type_name), []) if type_name else []
+                if len(type_defs) != 1:
+                    continue
+            type_nid = type_defs[0]
+            type_qualified = True
+        else:
+            type_name = type_table_by_file.get(src_file, {}).get(receiver)
+            if not type_name:
+                continue
+            type_defs = type_def_nids.get(_key(type_name), [])
+            if len(type_defs) != 1:  # ambiguous or absent -> bail (god-node guard)
+                continue
+            type_nid = type_defs[0]
+            type_qualified = False
+        callee_key = _key(callee)
+        # Virtual dispatch: prefer a concrete implementor's override over the
+        # interface's abstract declaration. Implementors of `type_nid` are the
+        # sources of `implements` edges targeting it.
+        impl_method_nids = [
+            method_index[(impl, callee_key)]
+            for impl in implementors.get(type_nid, [])
+            if (impl, callee_key) in method_index
+        ]
+        direct = method_index.get((type_nid, callee_key))
+        if len(impl_method_nids) == 1:
+            method_nid = impl_method_nids[0]
+        elif not impl_method_nids and direct:
+            method_nid = direct
+        else:
+            # >=2 competing implementors, or the type has no such method -> skip.
+            continue
+        if method_nid == caller or (caller, method_nid) in existing_pairs:
+            continue
+        existing_pairs.add((caller, method_nid))
+        all_edges.append({
+            "source": caller,
+            "target": method_nid,
+            "relation": "calls",
+            "context": "call",
+            "confidence": "EXTRACTED" if type_qualified else "INFERRED",
+            "confidence_score": 1.0 if type_qualified else 0.8,
+            "source_file": src_file,
+            "source_location": rc.get("source_location"),
+            "weight": 1.0,
+        })
+
+
 def _resolve_objc_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -12440,6 +12843,9 @@ register_language_resolver(
 # bound to the receiver's declared type instead of a bare same-named match.
 register_language_resolver(
     LanguageResolver("csharp_member_calls", frozenset({".cs"}), _resolve_csharp_member_calls)
+)
+register_language_resolver(
+    LanguageResolver("java_member_calls", frozenset({".java"}), _resolve_java_member_calls)
 )
 
 
