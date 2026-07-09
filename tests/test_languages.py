@@ -729,10 +729,15 @@ def test_java_method_reference_emits_call_signals(tmp_path):
     """Java `::` method references feed the same call-extraction path as `.`/`new` calls.
 
     - `Widget::new` (constructor ref) resolves in-file -> a `calls` edge run->Widget.
-    - `Helper::format` (static member ref) captures a raw_call (callee/receiver) for
-      the cross-file resolver, mirroring a plain `Helper.format()` static call.
-    - `System.out::println` (qualified receiver) bails the receiver but still captures
-      the callee name, so a qualified ref is never silently dropped.
+    - `Helper::format` (static member ref) emits a bare callee (is_member_call=False,
+      receiver=None) that mirrors a plain `Helper.format()` static call EXACTLY, so
+      with `Helper` defined in the same file it RESOLVES in-file to a run->format
+      `calls` edge. Capturing the receiver (is_member_call=True) previously made the
+      shared resolver DROP `Helper::format` while `Helper.format(o)` resolved -- an
+      inconsistency this fix removes.
+    - `System.out::println` (qualified receiver) is likewise left bare, so a
+      qualified ref is never silently dropped; with no matching in-file node it stays
+      an unresolved raw_call (is_member_call=False), exactly like `System.out.println(x)`.
     """
     source = tmp_path / "Refs.java"
     source.write_text(
@@ -748,19 +753,64 @@ def test_java_method_reference_emits_call_signals(tmp_path):
     )
 
     result = extract_java(source)
+    calls = _calls(result)
 
     # constructor ref -> in-file calls edge
-    assert (".run()", ".Widget()") in _calls(result)
+    assert (".run()", ".Widget()") in calls
+    # static member ref -> resolves in-file EXACTLY like `Helper.format(o)` would (THE FIX)
+    assert (".run()", ".format()") in calls
 
+    # qualified-receiver ref -> callee captured, left bare (not dropped); no in-file
+    # node named `println`, so it remains an unresolved raw_call with no member flag.
     raw = result.get("raw_calls") or []
     by_callee = {rc.get("callee"): rc for rc in raw}
-    # static member ref -> raw_call carries callee + capitalized receiver for cross-file resolution
-    assert "format" in by_callee
-    assert by_callee["format"].get("is_member_call") is True
-    assert by_callee["format"].get("receiver") == "Helper"
-    # qualified-receiver ref -> receiver bailed, but callee still captured (not dropped)
     assert "println" in by_callee
+    assert by_callee["println"].get("is_member_call") is False
     assert by_callee["println"].get("receiver") is None
+
+
+def test_java_method_reference_resolves_cross_file_like_dot_call(tmp_path):
+    """End-to-end parity lock: a `Helper::format` method reference must produce the
+    SAME cross-file `run->format` calls edge as a plain `Helper.format(o)` call.
+
+    This is the honest end-to-end assertion for the HIGH-1 fix: it exercises the
+    real multi-file `extract()` resolver (not just raw_call capture) and proves the
+    `::` form is no longer silently dropped by the is_member_call filter.
+    """
+    from graphify.extract import extract
+
+    (tmp_path / "Helper.java").write_text(
+        "class Helper { static String format(Object o) { return \"\"; } }\n"
+    )
+    ref_main = tmp_path / "RefMain.java"
+    ref_main.write_text(
+        "class RefMain {\n"
+        "  void runRef() {\n"
+        "    java.util.function.Function<Object,String> f = Helper::format;\n"
+        "  }\n"
+        "}\n"
+    )
+    dot_main = tmp_path / "DotMain.java"
+    dot_main.write_text(
+        "class DotMain {\n"
+        "  void runDot() {\n"
+        "    Helper.format(new Object());\n"
+        "  }\n"
+        "}\n"
+    )
+
+    r = extract([tmp_path / "Helper.java", ref_main, dot_main],
+                cache_root=Path("/tmp/graphify-test-no-cache"))
+    calls = _calls(r)
+
+    # dot call resolves (baseline)
+    assert any("runDot" in src and "format" in tgt for src, tgt in calls), (
+        f"expected DotMain.runDot->format calls edge, got {calls}"
+    )
+    # method reference resolves too -> `::` form reaches `format` identically
+    assert any("runRef" in src and "format" in tgt for src, tgt in calls), (
+        f"expected RefMain.runRef->format calls edge (HIGH-1 fix), got {calls}"
+    )
 
 
 def test_csharp_field_type_references_have_field_context():

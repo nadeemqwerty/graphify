@@ -1015,7 +1015,8 @@ def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
 # `_java_annotation_names`) grouped by the semantic role they signal to a
 # downstream reader. These drive additive `metadata` on the class node and on the
 # existing `references`/`attribute` annotation edge — they never change graph
-# topology (no new nodes/edges), so cached/uncached extraction stays byte-stable.
+# topology (no new nodes/edges), so cached/uncached extraction stays
+# topology-stable (node/edge SET is unchanged; only additive metadata differs).
 _JAVA_ANNO_EXPOSURE = frozenset({
     "RestController", "Controller", "RequestMapping", "GetMapping", "PostMapping",
     "PutMapping", "DeleteMapping", "PatchMapping",
@@ -5337,9 +5338,9 @@ def _extract_generic(
                 # `type_arguments`): child[0] = receiver/type, last child = the
                 # callee token — an `identifier` for a normal ref, or the `new`
                 # keyword for a constructor reference.
-                #   `Helper::format`      -> member call, receiver "Helper"
-                #   `System.out::println` -> callee "println", receiver bailed
-                #                            (field_access, not a simple name)
+                #   `Helper::format`      -> callee "format", no member flag
+                #                            (mirrors `Helper.format(o)` exactly)
+                #   `System.out::println` -> callee "println" (bare, like the dot form)
                 #   `A::new`              -> constructor ref, callee = type "A"
                 #                            (parallels object_creation above)
                 kids = [c for c in node.children if c.type != "::"]
@@ -5354,16 +5355,16 @@ def _extract_generic(
                             if raw:
                                 callee_name = raw.rsplit(".", 1)[-1]
                     else:
+                        # Emit the bare callee with NO member flag, exactly like
+                        # Java method_invocation: that branch reads only the `name`
+                        # field, so `Helper.format(o)` yields callee "format",
+                        # is_member_call=False, and resolves cross-file. A method
+                        # reference must resolve identically — capturing the receiver
+                        # here (is_member_call=True) made the shared resolver DROP
+                        # `Helper::format` while `Helper.format(o)` resolved, an
+                        # inconsistency. A qualified receiver (`System.out::println`)
+                        # is likewise left bare, mirroring the dot form.
                         callee_name = _read_text(last, source)
-                        # A simple-identifier receiver (a type/var name) binds
-                        # like a static member call `Type.method()`; capture it
-                        # so cross-file resolution can match by the receiver's
-                        # declared type. A qualified receiver (field_access such
-                        # as `System.out`) is bailed, mirroring the chained-call
-                        # rule for method_invocation.
-                        if recv_node is not None and recv_node.type == "identifier":
-                            is_member_call = True
-                            member_receiver = _read_text(recv_node, source)
             elif config.ts_module == "tree_sitter_ruby":
                 # Ruby's `call` node carries `receiver` and `method` as direct
                 # fields (no intermediate accessor node), so the generic accessor
