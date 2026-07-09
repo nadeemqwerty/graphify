@@ -1018,12 +1018,19 @@ def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
 # topology (no new nodes/edges), so cached/uncached extraction stays byte-stable.
 _JAVA_ANNO_EXPOSURE = frozenset({
     "RestController", "Controller", "RequestMapping", "GetMapping", "PostMapping",
-    "PutMapping", "DeleteMapping", "PatchMapping", "FeignClient",
+    "PutMapping", "DeleteMapping", "PatchMapping",
 })
+# Outbound HTTP clients (Spring Cloud OpenFeign) — an inbound endpoint marker would
+# be misleading here: `@FeignClient` declares a caller, not a server route.
+_JAVA_ANNO_HTTP_CLIENT = frozenset({"FeignClient"})
 _JAVA_ANNO_AUTHZ = frozenset({
     "PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed",
-    "PermitAll", "DenyAll", "PreFilter", "PostFilter",
+    "DenyAll", "PreFilter", "PostFilter",
 })
+# `@PermitAll` is the inverse of a guard — it explicitly marks the target *public*.
+# Bucketing it with the guards above would let a reader mistake an intentionally
+# open endpoint for a secured one, so it gets its own non-guard role.
+_JAVA_ANNO_AUTHZ_PUBLIC = frozenset({"PermitAll"})
 _JAVA_ANNO_STEREOTYPE = frozenset({
     "Service", "Component", "Repository", "Configuration",
     "RestController", "Controller",
@@ -1035,14 +1042,19 @@ def _classify_java_annotation(name: str) -> str | None:
     """Map a bare Java annotation short-name to one LLM-comprehension role bucket.
 
     Priority resolves overlaps (e.g. `@RestController` is both an exposure marker
-    and a bean stereotype): authz_guard > exposure > bean_stereotype > injection.
+    and a bean stereotype): authz_guard > authz_public > exposure > http_client >
+    bean_stereotype > injection.
     Returns ``None`` for annotations we don't classify — those keep only the
     generic ``references``/``attribute`` edge with no ``annotation_role``.
     """
     if name in _JAVA_ANNO_AUTHZ:
         return "authz_guard"
+    if name in _JAVA_ANNO_AUTHZ_PUBLIC:
+        return "authz_public"
     if name in _JAVA_ANNO_EXPOSURE:
         return "exposure"
+    if name in _JAVA_ANNO_HTTP_CLIENT:
+        return "http_client"
     if name in _JAVA_ANNO_STEREOTYPE:
         return "bean_stereotype"
     if name in _JAVA_ANNO_INJECTION:
@@ -1054,9 +1066,14 @@ def _java_class_annotation_facts(anno_names: list[str]) -> dict:
     """Derive class-level annotation facts from its class-level annotation names.
 
     Returns a (possibly empty) dict folded into the class node ``metadata``:
-      * ``bean_stereotype`` — first Spring stereotype found (Service/Component/…)
-      * ``http_endpoint``   — True if any exposure annotation is present
-      * ``authz_guarded``   — True if any method-security annotation is present
+      * ``bean_stereotype``      — first Spring stereotype found (Service/Component/…)
+      * ``http_endpoint``        — True if any inbound exposure annotation is present
+      * ``http_client``          — True if an outbound client annotation (@FeignClient)
+      * ``class_authz_guarded``  — True if a *class-level* method-security annotation is
+        present. NOTE: this is class-scoped only. A class secured solely via
+        method-level `@PreAuthorize` will NOT set this — absence here is not proof the
+        class is unguarded; consult the method-level annotation-edge ``annotation_role``.
+      * ``class_authz_public``   — True if a class-level `@PermitAll` marks it public
     """
     facts: dict = {}
     stereotype = next((n for n in anno_names if n in _JAVA_ANNO_STEREOTYPE), None)
@@ -1064,8 +1081,12 @@ def _java_class_annotation_facts(anno_names: list[str]) -> dict:
         facts["bean_stereotype"] = stereotype
     if any(n in _JAVA_ANNO_EXPOSURE for n in anno_names):
         facts["http_endpoint"] = True
+    if any(n in _JAVA_ANNO_HTTP_CLIENT for n in anno_names):
+        facts["http_client"] = True
     if any(n in _JAVA_ANNO_AUTHZ for n in anno_names):
-        facts["authz_guarded"] = True
+        facts["class_authz_guarded"] = True
+    if any(n in _JAVA_ANNO_AUTHZ_PUBLIC for n in anno_names):
+        facts["class_authz_public"] = True
     return facts
 
 
@@ -4105,7 +4126,7 @@ def _extract_generic(
                 for anno_name in java_anno_names:
                     target_nid = ensure_named_node(anno_name, line)
                     if target_nid != class_nid:
-                        anno_meta: dict[str, str] = {"annotation": anno_name}
+                        anno_meta: dict[str, str] = {"ref_token": anno_name, "annotation": anno_name}
                         anno_role = _classify_java_annotation(anno_name)
                         if anno_role:
                             anno_meta["annotation_role"] = anno_role
@@ -4646,7 +4667,14 @@ def _extract_generic(
                 for anno_name in _java_annotation_names(node, source):
                     target_nid = ensure_named_node(anno_name, line)
                     if target_nid != func_nid:
-                        add_edge(func_nid, target_nid, "references", line, context="attribute")
+                        m_anno_meta: dict[str, str] = {
+                            "ref_token": anno_name, "annotation": anno_name,
+                        }
+                        m_anno_role = _classify_java_annotation(anno_name)
+                        if m_anno_role:
+                            m_anno_meta["annotation_role"] = m_anno_role
+                        add_edge(func_nid, target_nid, "references", line,
+                                 context="attribute", metadata=m_anno_meta)
 
             if config.ts_module == "tree_sitter_php":
                 params_container = None

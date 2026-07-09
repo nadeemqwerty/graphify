@@ -597,14 +597,14 @@ def test_java_restcontroller_class_marks_http_endpoint(tmp_path):
 
 
 def test_java_preauthorize_class_is_authz_guarded(tmp_path):
-    """@PreAuthorize(...) -> authz_guarded node fact; edge role=authz_guard."""
+    """@PreAuthorize(...) -> class_authz_guarded node fact; edge role=authz_guard."""
     source = tmp_path / "Guard.java"
     source.write_text('@PreAuthorize("hasRole(\'ADMIN\')")\nclass AdminOps {}\n')
 
     result = extract_java(source)
 
     assert (_node_by_label(result, "AdminOps").get("metadata") or {}).get(
-        "authz_guarded"
+        "class_authz_guarded"
     ) is True
     assert _annotation_edge_meta(result, "AdminOps", "PreAuthorize").get(
         "annotation_role"
@@ -621,10 +621,108 @@ def test_java_unclassified_annotation_has_no_role_or_facts(tmp_path):
     node_md = _node_by_label(result, "OrderRow").get("metadata") or {}
     assert "bean_stereotype" not in node_md
     assert "http_endpoint" not in node_md
-    assert "authz_guarded" not in node_md
+    assert "class_authz_guarded" not in node_md
     meta = _annotation_edge_meta(result, "OrderRow", "Entity")
     assert meta.get("annotation") == "Entity"
     assert "annotation_role" not in meta
+
+
+def test_java_permitall_class_is_public_not_guarded(tmp_path):
+    """@PermitAll -> class_authz_public fact, NOT class_authz_guarded; edge role=authz_public.
+
+    Regression for critic-1a HIGH-1: `@PermitAll` is the inverse of a guard — bucketing
+    it as authz_guard would flag an intentionally-public endpoint as secured.
+    """
+    source = tmp_path / "Public.java"
+    source.write_text("@PermitAll\nclass PingApi {}\n")
+
+    result = extract_java(source)
+
+    md = _node_by_label(result, "PingApi").get("metadata") or {}
+    assert md.get("class_authz_public") is True
+    assert "class_authz_guarded" not in md
+    assert _annotation_edge_meta(result, "PingApi", "PermitAll").get(
+        "annotation_role"
+    ) == "authz_public"
+
+
+def test_java_feignclient_class_is_http_client_not_endpoint(tmp_path):
+    """@FeignClient -> http_client fact, NOT http_endpoint; edge role=http_client.
+
+    Regression for critic-1a LOW-6: Feign declares an *outbound* caller, so marking it
+    as an inbound http_endpoint would invert the data-flow direction.
+    """
+    source = tmp_path / "Client.java"
+    source.write_text('@FeignClient(name = "billing")\ninterface BillingClient {}\n')
+
+    result = extract_java(source)
+
+    md = _node_by_label(result, "BillingClient").get("metadata") or {}
+    assert md.get("http_client") is True
+    assert "http_endpoint" not in md
+    assert _annotation_edge_meta(result, "BillingClient", "FeignClient").get(
+        "annotation_role"
+    ) == "http_client"
+
+
+def test_java_method_level_authz_edge_carries_role(tmp_path):
+    """Method-level @PreAuthorize -> method annotation edge role=authz_guard + ref_token.
+
+    Regression for critic-1a HIGH-2: class-level facts only see class-level annotations,
+    so a class secured solely via method-level security must expose the signal on the
+    method annotation edge (absence of class_authz_guarded is not proof of "unguarded").
+    """
+    source = tmp_path / "Ops.java"
+    source.write_text(
+        "class UserOps {\n"
+        '  @PreAuthorize("hasRole(\'ADMIN\')")\n'
+        "  void deleteUser() {}\n"
+        "}\n"
+    )
+
+    result = extract_java(source)
+
+    # class node has NO class-level guard fact (guard is method-scoped here)
+    assert "class_authz_guarded" not in (
+        _node_by_label(result, "UserOps").get("metadata") or {}
+    )
+    # but the method annotation edge carries the role + ref_token
+    meta = _annotation_edge_meta(result, "deleteUser", "PreAuthorize")
+    assert meta.get("annotation_role") == "authz_guard"
+    assert meta.get("ref_token") == "PreAuthorize"
+
+
+def test_java_class_annotation_edge_carries_ref_token(tmp_path):
+    """Class annotation edge carries ref_token (repo convention) alongside annotation alias.
+
+    Regression for critic-1a MEDIUM-4.
+    """
+    source = tmp_path / "Svc2.java"
+    source.write_text("@Service\nclass OrderSvc {}\n")
+
+    result = extract_java(source)
+
+    meta = _annotation_edge_meta(result, "OrderSvc", "Service")
+    assert meta.get("ref_token") == "Service"
+    assert meta.get("annotation") == "Service"
+
+
+def test_groovy_service_class_carries_bean_stereotype_fact(tmp_path):
+    """@Service Groovy class -> class node bean_stereotype fact; edge role=bean_stereotype.
+
+    Regression for critic-1a MEDIUM-3: the annotation-fact impl covers Groovy too.
+    """
+    source = tmp_path / "Svc.groovy"
+    source.write_text("@Service\nclass PaymentSvc {}\n")
+
+    result = extract_groovy(source)
+
+    assert (_node_by_label(result, "PaymentSvc").get("metadata") or {}).get(
+        "bean_stereotype"
+    ) == "Service"
+    assert _annotation_edge_meta(result, "PaymentSvc", "Service").get(
+        "annotation_role"
+    ) == "bean_stereotype"
 
 
 def test_java_method_reference_emits_call_signals(tmp_path):
