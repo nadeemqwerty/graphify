@@ -3704,9 +3704,17 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
-            add_node(class_nid, class_name, line, metadata=metadata,
-                     end_line=node.end_point[0] + 1,
-                     start_col=node.start_point[1], end_col=node.end_point[1])
+            # impl-4: precise source_range is Java-only for now. Every other language's
+            # class-def node MUST stay byte-identical (rangeless) — the generic path here
+            # is shared by Python/C/C++/etc., so gate the range kwargs on Java. Covered by
+            # test_java_class_and_method_defs_carry_source_range (positive) and
+            # test_nonjava_defs_have_no_source_range (negative).
+            if config.ts_module == "tree_sitter_java":
+                add_node(class_nid, class_name, line, metadata=metadata,
+                         end_line=node.end_point[0] + 1,
+                         start_col=node.start_point[1], end_col=node.end_point[1])
+            else:
+                add_node(class_nid, class_name, line, metadata=metadata)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             add_edge(file_nid, class_nid, "contains", line)
 
@@ -4474,18 +4482,21 @@ def _extract_generic(
                 return
 
             line = node.start_point[0] + 1
-            _end_line = node.end_point[0] + 1
-            _start_col = node.start_point[1]
-            _end_col = node.end_point[1]
+            # impl-4: precise source_range is Java-only for now; non-Java function/method
+            # def nodes stay byte-identical (rangeless). This branch is shared by
+            # Python/C/C++/etc., so gate the range kwargs on Java. Negative regression:
+            # test_nonjava_defs_have_no_source_range.
+            _rng = ({"end_line": node.end_point[0] + 1,
+                     "start_col": node.start_point[1],
+                     "end_col": node.end_point[1]}
+                    if config.ts_module == "tree_sitter_java" else {})
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line,
-                         end_line=_end_line, start_col=_start_col, end_col=_end_col)
+                add_node(func_nid, f".{func_name}()", line, **_rng)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, func_name)
-                add_node(func_nid, f"{func_name}()", line,
-                         end_line=_end_line, start_col=_start_col, end_col=_end_col)
+                add_node(func_nid, f"{func_name}()", line, **_rng)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
             if config.ts_module == "tree_sitter_python":

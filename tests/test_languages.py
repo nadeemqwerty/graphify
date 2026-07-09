@@ -487,6 +487,29 @@ def test_java_rangeless_nodes_stay_byte_identical(tmp_path):
     assert ranged == {"Holder"}
 
 
+def test_nonjava_defs_have_no_source_range(tmp_path):
+    # impl-4 Java-only guard: the class-def and function/method-def code paths are shared
+    # across languages, but `source_range` must be emitted ONLY for Java so every other
+    # language stays byte-identical. Regression for the guard added at the class/function
+    # add_node sites (config.ts_module == "tree_sitter_java"). C++ exercises BOTH a class
+    # def (class_specifier), a method def, and a top-level function def.
+    source = tmp_path / "widget.cpp"
+    source.write_text(
+        "class Widget {\n"          # L1  class def
+        "public:\n"                 # L2
+        "    void render() {\n"      # L3  method def
+        "        int x = 1;\n"       # L4
+        "    }\n"                    # L5
+        "};\n"                       # L6
+        "int main() {\n"            # L7  top-level function def
+        "    return 0;\n"           # L8
+        "}\n"                        # L9
+    )
+    result = extract_cpp(source)
+    ranged = [n["label"] for n in result["nodes"] if "source_range" in n]
+    assert ranged == [], f"non-Java nodes must not carry source_range, got: {ranged}"
+
+
 def test_java_parameter_return_generic_and_attribute_contexts():
     result = extract_java(FIXTURES / "sample.java")
     assert ("build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
