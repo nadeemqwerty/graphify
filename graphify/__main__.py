@@ -4455,7 +4455,7 @@ def main() -> None:
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
-                "[--api-timeout S] [--postgres DSN] [--cargo] [--timing]",
+                "[--api-timeout S] [--postgres DSN] [--cargo] [--timing] [--multigraph]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -4491,6 +4491,8 @@ def main() -> None:
         cli_exclude_hubs: float | None = None
         cli_excludes: list[str] = []
         cli_timing: bool = False
+        # #698 blocker-1: opt-in MultiDiGraph substrate (parallel/keyed edges).
+        cli_multigraph: bool = False
 
         def _parse_int(name: str, raw: str) -> int:
             try:
@@ -4581,6 +4583,8 @@ def main() -> None:
                 i += 1
             elif a == "--timing":
                 cli_timing = True; i += 1
+            elif a == "--multigraph":
+                cli_multigraph = True; i += 1
             else:
                 i += 1
 
@@ -4624,6 +4628,17 @@ def main() -> None:
         manifest_path = graphify_out / "manifest.json"
         existing_graph_path = graphify_out / "graph.json"
         incremental_mode = manifest_path.exists() and existing_graph_path.exists() if has_path else False
+
+        # #698 blocker-1: multigraph changes the graph substrate (DiGraph ->
+        # MultiDiGraph), and build_merge() has no multigraph path, so an
+        # incremental merge into a prior plain-DiGraph graph.json cannot honor
+        # the flag. Force a full rebuild so --multigraph is never silently dropped.
+        if cli_multigraph and incremental_mode:
+            print(
+                "[graphify extract] --multigraph forces a full rebuild "
+                "(incremental merge does not support the multigraph substrate)"
+            )
+            incremental_mode = False
 
         if not has_path:
             code_files = []
@@ -5009,6 +5024,13 @@ def main() -> None:
                     _e["source_file"] = (
                         _node_sf.get(_e.get("source")) or _node_sf.get(_e.get("target")) or ""
                     )
+            # --multigraph: mark the raw dump as multigraph so the export is
+            # self-describing and the flag is observable end-to-end. The raw
+            # edge list already preserves parallel edges (dedupe_edges only drops
+            # exact duplicates), so this is a truthful marker, not a structural
+            # change. Opt-in only — omitted by default (byte-identical default).
+            if cli_multigraph:
+                merged["multigraph"] = True
             _backup(graphify_out)
             graph_json_path.write_text(
                 json.dumps(merged, indent=2), encoding="utf-8"
@@ -5068,7 +5090,7 @@ def main() -> None:
                 root=target,
             )
         else:
-            G = _build([merged], dedup=True, dedup_llm_backend=dedup_backend, root=target)
+            G = _build([merged], dedup=True, dedup_llm_backend=dedup_backend, root=target, multigraph=cli_multigraph)
         stages.mark("build")
         if G.number_of_nodes() == 0:
             print(
