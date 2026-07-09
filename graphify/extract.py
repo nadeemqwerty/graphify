@@ -3568,7 +3568,8 @@ def _extract_generic(
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
     def add_node(nid: str, label: str, line: int, *, node_type: str | None = None,
-                 metadata: dict | None = None) -> None:
+                 metadata: dict | None = None, end_line: int | None = None,
+                 start_col: int | None = None, end_col: int | None = None) -> None:
         if nid in seen_ids:
             return
         seen_ids.add(nid)
@@ -3584,6 +3585,18 @@ def _extract_generic(
             "source_file": str_path,
             "source_location": f"L{line}",
         }
+        # Additive precise span (impl-4 / plan §192-201 join key). Emitted ONLY when a
+        # caller threads an end_line, so every range-less add_node call site (~30
+        # closures, field/stub emitters) stays byte-identical. source_location is left
+        # UNCHANGED so existing consumers and content hashes never move. Columns are the
+        # raw 0-based tree-sitter column; start_line mirrors the 1-based `line` arg.
+        if end_line is not None:
+            node["source_range"] = {
+                "start_line": line,
+                "start_col": start_col,
+                "end_line": end_line,
+                "end_col": end_col,
+            }
         if node_type:
             node["type"] = node_type
         if merged:
@@ -3691,7 +3704,9 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
-            add_node(class_nid, class_name, line, metadata=metadata)
+            add_node(class_nid, class_name, line, metadata=metadata,
+                     end_line=node.end_point[0] + 1,
+                     start_col=node.start_point[1], end_col=node.end_point[1])
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             add_edge(file_nid, class_nid, "contains", line)
 
@@ -4459,13 +4474,18 @@ def _extract_generic(
                 return
 
             line = node.start_point[0] + 1
+            _end_line = node.end_point[0] + 1
+            _start_col = node.start_point[1]
+            _end_col = node.end_point[1]
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                add_node(func_nid, f".{func_name}()", line,
+                         end_line=_end_line, start_col=_start_col, end_col=_end_col)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, func_name)
-                add_node(func_nid, f"{func_name}()", line)
+                add_node(func_nid, f"{func_name}()", line,
+                         end_line=_end_line, start_col=_start_col, end_col=_end_col)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
             if config.ts_module == "tree_sitter_python":
