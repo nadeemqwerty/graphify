@@ -1,0 +1,74 @@
+[
+  {
+    "id": "q1",
+    "kind": "callees",
+    "question": "What methods does OrderService.place call?",
+    "target": "OrderService.place",
+    "expect": ["OrderRepo.save", "OrderService.validate"]
+  },
+  {
+    "id": "q2",
+    "kind": "callers",
+    "question": "Who calls OrderRepo.save?",
+    "target": "OrderRepo.save",
+    "expect": ["OrderService.place"]
+  },
+  {
+    "id": "q3",
+    "kind": "callers",
+    "question": "Who calls the private OrderRepo.read?",
+    "target": "OrderRepo.read",
+    "expect": ["OrderRepo.find"]
+  },
+  {
+    "id": "q4",
+    "kind": "callees",
+    "question": "What does the REST entry OrderController.create call?",
+    "target": "OrderController.create",
+    "expect": ["OrderService.place"]
+  },
+  {
+    "id": "q5",
+    "kind": "reaches",
+    "question": "Can OrderController.create reach OrderRepo.write via calls?",
+    "target": "OrderController.create",
+    "to": "OrderRepo.write",
+    "expect": true
+  },
+  {
+    "id": "q6",
+    "kind": "reaches",
+    "question": "Can OrderController.status reach OrderRepo.write via calls?",
+    "target": "OrderController.status",
+    "to": "OrderRepo.write",
+    "expect": false
+  },
+  {
+    "id": "q7",
+    "kind": "extends",
+    "question": "What does Order extend?",
+    "target": "Order",
+    "expect": ["BaseEntity"]
+  },
+  {
+    "id": "q8",
+    "kind": "references",
+    "question": "What is injected/referenced by OrderService?",
+    "target": "OrderService",
+    "expect": ["OrderRepo"]
+  },
+  {
+    "id": "q9",
+    "kind": "method_count",
+    "question": "How many methods does OrderRepo declare?",
+    "target": "OrderRepo",
+    "expect": 4
+  },
+  {
+    "id": "q10",
+    "kind": "god_top",
+    "question": "What are the two most connected classes (hubs)?",
+    "n": 2,
+    "expect": ["OrderRepo", "OrderService"]
+  }
+]
