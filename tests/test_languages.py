@@ -441,6 +441,75 @@ def test_java_type_parameters_do_not_emit_references(tmp_path):
     assert ("convert", "Payload") in _edge_labels(result, "references", "generic_arg")
 
 
+def test_java_class_and_method_defs_carry_source_range(tmp_path):
+    # impl-4: class + method/function def nodes carry an additive `source_range`
+    # (start/end line + col) computed from tree-sitter spans, on top of the existing
+    # single-line `source_location`. Lines are 1-based; cols are raw 0-based ts cols.
+    source = tmp_path / "Ranged.java"
+    source.write_text(
+        "class Widget {\n"          # L1
+        "    void render() {\n"      # L2
+        "        int x = 1;\n"       # L3
+        "    }\n"                    # L4
+        "}\n"                        # L5
+    )
+    result = extract_java(source)
+    by_label = {n["label"]: n for n in result["nodes"]}
+
+    cls = by_label["Widget"]
+    assert cls["source_location"] == "L1"          # unchanged single-line anchor
+    assert cls["source_range"] == {
+        "start_line": 1, "start_col": 0, "end_line": 5, "end_col": 1,
+    }
+
+    method = by_label[".render()"]
+    assert method["source_location"] == "L2"
+    mr = method["source_range"]
+    assert mr["start_line"] == 2 and mr["end_line"] == 4
+    assert mr["start_col"] == 4                     # method indented 4 spaces
+    assert mr["end_col"] == 5                       # closing brace col on L4
+
+
+def test_java_rangeless_nodes_stay_byte_identical(tmp_path):
+    # Additivity guard: nodes that are NOT class/function defs (imports, references,
+    # sourceless stubs) must NOT gain a source_range — the field is emitted ONLY when
+    # a caller threads end_line, so every other add_node call site is unchanged.
+    source = tmp_path / "NoRange.java"
+    source.write_text(
+        "import java.util.List;\n"
+        "class Holder {\n"
+        "    List<String> items;\n"
+        "}\n"
+    )
+    result = extract_java(source)
+    ranged = {n["label"] for n in result["nodes"] if "source_range" in n}
+    # Only the class def carries a range; the import target + field + type ref do not.
+    assert ranged == {"Holder"}
+
+
+def test_nonjava_defs_have_no_source_range(tmp_path):
+    # impl-4 Java-only guard: the class-def and function/method-def code paths are shared
+    # across languages, but `source_range` must be emitted ONLY for Java so every other
+    # language stays byte-identical. Regression for the guard added at the class/function
+    # add_node sites (config.ts_module == "tree_sitter_java"). C++ exercises BOTH a class
+    # def (class_specifier), a method def, and a top-level function def.
+    source = tmp_path / "widget.cpp"
+    source.write_text(
+        "class Widget {\n"          # L1  class def
+        "public:\n"                 # L2
+        "    void render() {\n"      # L3  method def
+        "        int x = 1;\n"       # L4
+        "    }\n"                    # L5
+        "};\n"                       # L6
+        "int main() {\n"            # L7  top-level function def
+        "    return 0;\n"           # L8
+        "}\n"                        # L9
+    )
+    result = extract_cpp(source)
+    ranged = [n["label"] for n in result["nodes"] if "source_range" in n]
+    assert ranged == [], f"non-Java nodes must not carry source_range, got: {ranged}"
+
+
 def test_java_parameter_return_generic_and_attribute_contexts():
     result = extract_java(FIXTURES / "sample.java")
     assert ("build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
@@ -551,6 +620,266 @@ def test_java_enum_and_annotation_declarations_are_type_nodes(tmp_path):
     }
     assert definitions["PaymentStatus"].get("source_file") == str(source)
     assert definitions["Audited"].get("source_file") == str(source)
+
+
+def _annotation_edge_meta(result: dict, src_label: str, tgt_label: str) -> dict:
+    """Return the metadata dict of the references/attribute edge src->tgt (by label)."""
+    labels = {node["id"]: _normalize_symbol_label(node["label"]) for node in result["nodes"]}
+    for edge in result["edges"]:
+        if edge.get("relation") != "references" or edge.get("context") != "attribute":
+            continue
+        if labels.get(edge["source"]) == src_label and labels.get(edge["target"]) == tgt_label:
+            return edge.get("metadata") or {}
+    raise AssertionError(f"missing annotation edge {src_label!r}->{tgt_label!r}")
+
+
+def test_java_service_class_carries_bean_stereotype_fact(tmp_path):
+    """@Service class -> class node metadata bean_stereotype (additive; §1A-core)."""
+    source = tmp_path / "Svc.java"
+    source.write_text("@Service\nclass PaymentSvc {}\n")
+
+    result = extract_java(source)
+
+    node = _node_by_label(result, "PaymentSvc")
+    assert (node.get("metadata") or {}).get("bean_stereotype") == "Service"
+    # the annotation edge is enriched but topology (relation/context) is unchanged
+    assert ("PaymentSvc", "Service") in _edge_labels(result, "references", "attribute")
+    meta = _annotation_edge_meta(result, "PaymentSvc", "Service")
+    assert meta.get("annotation") == "Service"
+    assert meta.get("annotation_role") == "bean_stereotype"
+
+
+def test_java_restcontroller_class_marks_http_endpoint(tmp_path):
+    """@RestController -> http_endpoint + bean_stereotype node facts; edge role=exposure."""
+    source = tmp_path / "Api.java"
+    source.write_text('@RestController\nclass OrderApi {}\n')
+
+    result = extract_java(source)
+
+    md = _node_by_label(result, "OrderApi").get("metadata") or {}
+    assert md.get("http_endpoint") is True
+    assert md.get("bean_stereotype") == "RestController"
+    # exposure wins over stereotype on the edge role (priority order)
+    assert _annotation_edge_meta(result, "OrderApi", "RestController").get(
+        "annotation_role"
+    ) == "exposure"
+
+
+def test_java_preauthorize_class_is_authz_guarded(tmp_path):
+    """@PreAuthorize(...) -> class_authz_guarded node fact; edge role=authz_guard."""
+    source = tmp_path / "Guard.java"
+    source.write_text('@PreAuthorize("hasRole(\'ADMIN\')")\nclass AdminOps {}\n')
+
+    result = extract_java(source)
+
+    assert (_node_by_label(result, "AdminOps").get("metadata") or {}).get(
+        "class_authz_guarded"
+    ) is True
+    assert _annotation_edge_meta(result, "AdminOps", "PreAuthorize").get(
+        "annotation_role"
+    ) == "authz_guard"
+
+
+def test_java_unclassified_annotation_has_no_role_or_facts(tmp_path):
+    """@Entity (unclassified) -> edge carries annotation name but NO role; no node facts."""
+    source = tmp_path / "Ent.java"
+    source.write_text('@Entity(name = "orders")\nclass OrderRow {}\n')
+
+    result = extract_java(source)
+
+    node_md = _node_by_label(result, "OrderRow").get("metadata") or {}
+    assert "bean_stereotype" not in node_md
+    assert "http_endpoint" not in node_md
+    assert "class_authz_guarded" not in node_md
+    meta = _annotation_edge_meta(result, "OrderRow", "Entity")
+    assert meta.get("annotation") == "Entity"
+    assert "annotation_role" not in meta
+
+
+def test_java_permitall_class_is_public_not_guarded(tmp_path):
+    """@PermitAll -> class_authz_public fact, NOT class_authz_guarded; edge role=authz_public.
+
+    Regression for critic-1a HIGH-1: `@PermitAll` is the inverse of a guard — bucketing
+    it as authz_guard would flag an intentionally-public endpoint as secured.
+    """
+    source = tmp_path / "Public.java"
+    source.write_text("@PermitAll\nclass PingApi {}\n")
+
+    result = extract_java(source)
+
+    md = _node_by_label(result, "PingApi").get("metadata") or {}
+    assert md.get("class_authz_public") is True
+    assert "class_authz_guarded" not in md
+    assert _annotation_edge_meta(result, "PingApi", "PermitAll").get(
+        "annotation_role"
+    ) == "authz_public"
+
+
+def test_java_feignclient_class_is_http_client_not_endpoint(tmp_path):
+    """@FeignClient -> http_client fact, NOT http_endpoint; edge role=http_client.
+
+    Regression for critic-1a LOW-6: Feign declares an *outbound* caller, so marking it
+    as an inbound http_endpoint would invert the data-flow direction.
+    """
+    source = tmp_path / "Client.java"
+    source.write_text('@FeignClient(name = "billing")\ninterface BillingClient {}\n')
+
+    result = extract_java(source)
+
+    md = _node_by_label(result, "BillingClient").get("metadata") or {}
+    assert md.get("http_client") is True
+    assert "http_endpoint" not in md
+    assert _annotation_edge_meta(result, "BillingClient", "FeignClient").get(
+        "annotation_role"
+    ) == "http_client"
+
+
+def test_java_method_level_authz_edge_carries_role(tmp_path):
+    """Method-level @PreAuthorize -> method annotation edge role=authz_guard + ref_token.
+
+    Regression for critic-1a HIGH-2: class-level facts only see class-level annotations,
+    so a class secured solely via method-level security must expose the signal on the
+    method annotation edge (absence of class_authz_guarded is not proof of "unguarded").
+    """
+    source = tmp_path / "Ops.java"
+    source.write_text(
+        "class UserOps {\n"
+        '  @PreAuthorize("hasRole(\'ADMIN\')")\n'
+        "  void deleteUser() {}\n"
+        "}\n"
+    )
+
+    result = extract_java(source)
+
+    # class node has NO class-level guard fact (guard is method-scoped here)
+    assert "class_authz_guarded" not in (
+        _node_by_label(result, "UserOps").get("metadata") or {}
+    )
+    # but the method annotation edge carries the role + ref_token
+    meta = _annotation_edge_meta(result, "deleteUser", "PreAuthorize")
+    assert meta.get("annotation_role") == "authz_guard"
+    assert meta.get("ref_token") == "PreAuthorize"
+
+
+def test_java_class_annotation_edge_carries_ref_token(tmp_path):
+    """Class annotation edge carries ref_token (repo convention) alongside annotation alias.
+
+    Regression for critic-1a MEDIUM-4.
+    """
+    source = tmp_path / "Svc2.java"
+    source.write_text("@Service\nclass OrderSvc {}\n")
+
+    result = extract_java(source)
+
+    meta = _annotation_edge_meta(result, "OrderSvc", "Service")
+    assert meta.get("ref_token") == "Service"
+    assert meta.get("annotation") == "Service"
+
+
+def test_groovy_service_class_carries_bean_stereotype_fact(tmp_path):
+    """@Service Groovy class -> class node bean_stereotype fact; edge role=bean_stereotype.
+
+    Regression for critic-1a MEDIUM-3: the annotation-fact impl covers Groovy too.
+    """
+    source = tmp_path / "Svc.groovy"
+    source.write_text("@Service\nclass PaymentSvc {}\n")
+
+    result = extract_groovy(source)
+
+    assert (_node_by_label(result, "PaymentSvc").get("metadata") or {}).get(
+        "bean_stereotype"
+    ) == "Service"
+    assert _annotation_edge_meta(result, "PaymentSvc", "Service").get(
+        "annotation_role"
+    ) == "bean_stereotype"
+
+
+def test_java_method_reference_emits_call_signals(tmp_path):
+    """Java `::` method references feed the same call-extraction path as `.`/`new` calls.
+
+    - `Widget::new` (constructor ref) resolves in-file -> a `calls` edge run->Widget.
+    - `Helper::format` (static member ref) emits a bare callee (is_member_call=False,
+      receiver=None) that mirrors a plain `Helper.format()` static call EXACTLY, so
+      with `Helper` defined in the same file it RESOLVES in-file to a run->format
+      `calls` edge. Capturing the receiver (is_member_call=True) previously made the
+      shared resolver DROP `Helper::format` while `Helper.format(o)` resolved -- an
+      inconsistency this fix removes.
+    - `System.out::println` (qualified receiver) is likewise left bare, so a
+      qualified ref is never silently dropped; with no matching in-file node it stays
+      an unresolved raw_call (is_member_call=False), exactly like `System.out.println(x)`.
+    """
+    source = tmp_path / "Refs.java"
+    source.write_text(
+        "class Helper { static String format(Object o) { return \"\"; } }\n"
+        "class Widget { Widget() {} }\n"
+        "class Main {\n"
+        "  void run() {\n"
+        "    java.util.function.Function<Object,String> f = Helper::format;\n"
+        "    java.util.function.Supplier<Widget> s = Widget::new;\n"
+        "    Runnable r = System.out::println;\n"
+        "  }\n"
+        "}\n"
+    )
+
+    result = extract_java(source)
+    calls = _calls(result)
+
+    # constructor ref -> in-file calls edge
+    assert (".run()", ".Widget()") in calls
+    # static member ref -> resolves in-file EXACTLY like `Helper.format(o)` would (THE FIX)
+    assert (".run()", ".format()") in calls
+
+    # qualified-receiver ref -> callee captured, left bare (not dropped); no in-file
+    # node named `println`, so it remains an unresolved raw_call with no member flag.
+    raw = result.get("raw_calls") or []
+    by_callee = {rc.get("callee"): rc for rc in raw}
+    assert "println" in by_callee
+    assert by_callee["println"].get("is_member_call") is False
+    assert by_callee["println"].get("receiver") is None
+
+
+def test_java_method_reference_resolves_cross_file_like_dot_call(tmp_path):
+    """End-to-end parity lock: a `Helper::format` method reference must produce the
+    SAME cross-file `run->format` calls edge as a plain `Helper.format(o)` call.
+
+    This is the honest end-to-end assertion for the HIGH-1 fix: it exercises the
+    real multi-file `extract()` resolver (not just raw_call capture) and proves the
+    `::` form is no longer silently dropped by the is_member_call filter.
+    """
+    from graphify.extract import extract
+
+    (tmp_path / "Helper.java").write_text(
+        "class Helper { static String format(Object o) { return \"\"; } }\n"
+    )
+    ref_main = tmp_path / "RefMain.java"
+    ref_main.write_text(
+        "class RefMain {\n"
+        "  void runRef() {\n"
+        "    java.util.function.Function<Object,String> f = Helper::format;\n"
+        "  }\n"
+        "}\n"
+    )
+    dot_main = tmp_path / "DotMain.java"
+    dot_main.write_text(
+        "class DotMain {\n"
+        "  void runDot() {\n"
+        "    Helper.format(new Object());\n"
+        "  }\n"
+        "}\n"
+    )
+
+    r = extract([tmp_path / "Helper.java", ref_main, dot_main],
+                cache_root=Path("/tmp/graphify-test-no-cache"))
+    calls = _calls(r)
+
+    # dot call resolves (baseline)
+    assert any("runDot" in src and "format" in tgt for src, tgt in calls), (
+        f"expected DotMain.runDot->format calls edge, got {calls}"
+    )
+    # method reference resolves too -> `::` form reaches `format` identically
+    assert any("runRef" in src and "format" in tgt for src, tgt in calls), (
+        f"expected RefMain.runRef->format calls edge (HIGH-1 fix), got {calls}"
+    )
 
 
 def test_csharp_field_type_references_have_field_context():
