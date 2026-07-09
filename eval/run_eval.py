@@ -32,12 +32,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-# graphify flushes its stat-index cache via its OWN atexit hook (registered at
-# import time), which re-creates the per-run cache dir AFTER an ordinary cleanup
-# has already removed it. atexit callbacks fire LIFO, so registering our cleanup
-# *before* importing graphify guarantees ours runs LAST -- after graphify's
-# flush -- so the temp cache is always fully removed (no leftover graphify-eval-*
-# dirs). This is cleanup-only and runs post-computation: it cannot affect answers.
+# graphify flushes its stat-index cache via its OWN atexit hook, registered
+# LAZILY on first cache use during extract() (NOT at import time). That flush
+# re-creates the per-run cache dir AFTER an ordinary cleanup has already removed
+# it. atexit callbacks fire LIFO, and graphify always registers its hook strictly
+# AFTER this module's line-49 registration (import happens after line 49, and the
+# lazy first-use registration is later still) -- so ours is the EARLIEST-registered
+# hook and therefore runs LAST, after graphify's flush. The temp cache is thus
+# always fully removed (no leftover graphify-eval-* dirs). This is cleanup-only and
+# runs post-computation: it cannot affect answers.
 _EVAL_TMP_DIRS: list[Path] = []
 
 
