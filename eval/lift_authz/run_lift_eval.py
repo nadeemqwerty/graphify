@@ -17,6 +17,17 @@ Design guarantees (deterministic, zero-AI):
 Exit 0 iff graph accuracy > naive accuracy AND mutated-graph accuracy <
 graph accuracy. Otherwise exit 1.
 
+Scope (what this deliberately does NOT prove):
+  * It is a narrow lift proof on 4 controlled Spring fixtures, not a general
+    proof of authz-extraction correctness. It does not exercise inheritance,
+    composed/meta annotations, multiple controllers per file, or non-PreAuthorize
+    authz mechanisms.
+  * The pytest regression (tests/test_lift_authz.py) locks THIS harness's
+    committed behavior; it re-invokes evaluate() and is not an independent oracle.
+  * The mutation test is an in-harness ablation: it proves graph_predict depends
+    on the framework facts for these fixtures, not that the extractor is
+    semantically correct in every case.
+
 Usage:
     python run_lift_eval.py [--json]
 """
